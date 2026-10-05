@@ -15,45 +15,53 @@ export class ProviderService {
   processEvent(event: ProviderEventDto): EventResult {
     const db = this.dbService.getDb();
     
-    // ALL operations run inside ONE synchronous transaction
-    // .immediate() prevents concurrent writers from starting
-    const result = db.transaction(() => {
-      // 1. Wallet must exist
-      const wallet = db.prepare('SELECT id, currency, balance_kobo FROM wallets WHERE id = ?').get(event.walletId) as any;
-      if (!wallet) {
-        throw new NotFoundException(`Wallet ${event.walletId} not found`);
+    // Pre-flight checks outside main transaction (read-only, can throw without rollback concerns)
+    // These checks don't modify state, so exceptions here are safe
+    
+    // 1. Wallet must exist
+    const wallet = db.prepare('SELECT id, currency, balance_kobo FROM wallets WHERE id = ?').get(event.walletId) as any;
+    if (!wallet) {
+      throw new NotFoundException(`Wallet ${event.walletId} not found`);
+    }
+
+    // 2. Currency must match wallet
+    if (wallet.currency !== event.currency) {
+      throw new ConflictException(`Currency mismatch: wallet is ${wallet.currency}, event is ${event.currency}`);
+    }
+
+    // 3. Check if eventId already exists
+    const existingEvent = db.prepare(
+      'SELECT event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome FROM provider_events WHERE event_id = ?'
+    ).get(event.eventId) as any;
+
+    if (existingEvent) {
+      // Identical payload? Return stored result (idempotent)
+      if (
+        existingEvent.transaction_ref === event.transactionRef &&
+        existingEvent.wallet_id === event.walletId &&
+        existingEvent.amount_kobo === event.amountKobo &&
+        existingEvent.currency === event.currency &&
+        existingEvent.status === event.status
+      ) {
+        return { success: true, duplicate: true, message: 'Event already processed with same payload' };
       }
 
-      // 2. Currency must match wallet
-      if (wallet.currency !== event.currency) {
-        throw new ConflictException(`Currency mismatch: wallet is ${wallet.currency}, event is ${event.currency}`);
-      }
-
-      // 3. Check if eventId already exists
-      const existingEvent = db.prepare(
-        'SELECT event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome FROM provider_events WHERE event_id = ?'
-      ).get(event.eventId) as any;
-
-      if (existingEvent) {
-        // Identical payload? Return stored result
-        if (
-          existingEvent.transaction_ref === event.transactionRef &&
-          existingEvent.wallet_id === event.walletId &&
-          existingEvent.amount_kobo === event.amountKobo &&
-          existingEvent.currency === event.currency &&
-          existingEvent.status === event.status
-        ) {
-          return { success: true, duplicate: true, message: 'Event already processed with same payload' };
-        }
-
-        // Different payload with same eventId - reject
+      // Different payload with same eventId - persist rejection in separate transaction, then throw
+      // Separate transaction ensures audit record survives the exception
+      db.transaction(() => {
         db.prepare(`
           INSERT INTO rejected_events (event_id, raw_payload, reason)
           VALUES (?, ?, ?)
         `).run(event.eventId, JSON.stringify(event), 'Duplicate eventId with different payload');
-        
-        throw new ConflictException('Event ID already used with different payload');
-      }
+      }).immediate();
+      
+      throw new ConflictException('Event ID already used with different payload');
+    }
+    
+    // ALL state-changing operations run inside ONE synchronous transaction
+    // .immediate() prevents concurrent writers from starting
+    // If this transaction throws, ALL changes within it roll back
+    const result = db.transaction(() => {
 
       // 4. Check if transactionRef already exists
       const existingTxn = db.prepare(
@@ -67,10 +75,14 @@ export class ProviderService {
           existingTxn.amount_kobo !== event.amountKobo ||
           existingTxn.currency !== event.currency
         ) {
-          db.prepare(`
-            INSERT INTO rejected_events (event_id, raw_payload, reason)
-            VALUES (?, ?, ?)
-          `).run(event.eventId, JSON.stringify(event), 'Transaction attributes mismatch');
+          // Persist rejection in nested transaction (commits immediately), then throw
+          // Nested transaction commits independently - audit record survives the outer rollback
+          db.transaction(() => {
+            db.prepare(`
+              INSERT INTO rejected_events (event_id, raw_payload, reason)
+              VALUES (?, ?, ?)
+            `).run(event.eventId, JSON.stringify(event), 'Transaction attributes mismatch');
+          }).immediate();
           
           throw new ConflictException('Transaction reference exists with different attributes');
         }
@@ -151,10 +163,14 @@ export class ProviderService {
           (currentStatus === 'successful' && newStatus === 'failed') ||
           (currentStatus === 'failed' && newStatus === 'successful')
         ) {
-          db.prepare(`
-            INSERT INTO provider_events (event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'conflict_terminal');
+          // Persist conflict event in nested transaction (commits immediately), then throw
+          // Nested transaction commits independently - conflict audit survives the outer rollback
+          db.transaction(() => {
+            db.prepare(`
+              INSERT INTO provider_events (event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'conflict_terminal');
+          }).immediate();
 
           throw new ConflictException('Terminal status conflict - manual review required');
         }
