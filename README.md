@@ -316,6 +316,27 @@ src/
     └── wallets.service.ts         # Wallet queries
 ```
 
+### Transaction Rollback Behavior
+
+**better-sqlite3 automatic rollback:**
+- If any exception is thrown inside `db.transaction(() => {...}).immediate()`, ALL changes roll back
+- This ensures atomicity: either all operations succeed or none do
+
+**Audit record preservation:**
+- Conflict/rejection records use **nested transactions** that commit independently
+- Pattern: `db.transaction(() => { INSERT audit }).immediate(); throw exception;`
+- The nested transaction commits before the exception, so audit survives
+- Examples: `rejected_events` (duplicate eventId), `provider_events` (terminal conflicts)
+
+**Pre-flight checks:**
+- Read-only validations (wallet existence, currency match) happen BEFORE main transaction
+- Exceptions from these checks have no rollback concerns (no writes occurred)
+
+**Main transaction guarantees:**
+- Balance updates ONLY happen with ledger_entry INSERT (same transaction)
+- If ledger insert fails, balance rollback is automatic
+- UNIQUE constraint on `transaction_ref` provides DB-level double-credit prevention
+
 ## Database Schema
 
 ```sql
