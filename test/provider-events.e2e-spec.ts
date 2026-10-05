@@ -489,4 +489,121 @@ describe('Provider Events (e2e)', () => {
     expect(response.body.availableBalanceKobo).toBe(ledgerSum.total);
     expect(response.body.availableBalanceKobo).toBe(150000); // 100000 + 50000, failed doesn't count
   });
+
+  it('audit: rejected_events persists after transaction attributes mismatch (409)', async () => {
+    // Create initial transaction
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E026',
+        transactionRef: 'T017',
+        walletId: 'W001',
+        amountKobo: 100000,
+        currency: 'NGN',
+        status: 'successful'
+      })
+      .expect(200);
+
+    // Conflicting amount for same transactionRef
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E027',
+        transactionRef: 'T017',
+        walletId: 'W001',
+        amountKobo: 200000,
+        currency: 'NGN',
+        status: 'successful'
+      })
+      .expect(409);
+
+    // Verify rejected_events row exists
+    const db = dbService.getDb();
+    const rejectedEvent = db.prepare(
+      'SELECT event_id, reason FROM rejected_events WHERE event_id = ?'
+    ).get('E027') as any;
+
+    expect(rejectedEvent).toBeDefined();
+    expect(rejectedEvent.event_id).toBe('E027');
+    expect(rejectedEvent.reason).toBe('Transaction attributes mismatch');
+  });
+
+  it('audit: provider_events persists conflict_terminal after opposite terminal event (409)', async () => {
+    // Create successful transaction
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E028',
+        transactionRef: 'T018',
+        walletId: 'W001',
+        amountKobo: 100000,
+        currency: 'NGN',
+        status: 'successful'
+      })
+      .expect(200);
+
+    // Try to mark as failed (opposite terminal)
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E029',
+        transactionRef: 'T018',
+        walletId: 'W001',
+        amountKobo: 100000,
+        currency: 'NGN',
+        status: 'failed'
+      })
+      .expect(409);
+
+    // Verify provider_events row exists with conflict_terminal
+    const db = dbService.getDb();
+    const conflictEvent = db.prepare(
+      'SELECT event_id, outcome FROM provider_events WHERE event_id = ?'
+    ).get('E029') as any;
+
+    expect(conflictEvent).toBeDefined();
+    expect(conflictEvent.event_id).toBe('E029');
+    expect(conflictEvent.outcome).toBe('conflict_terminal');
+  });
+
+  it('replayed conflict returns 409 not 200', async () => {
+    // Create successful transaction
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E030',
+        transactionRef: 'T019',
+        walletId: 'W001',
+        amountKobo: 100000,
+        currency: 'NGN',
+        status: 'successful'
+      })
+      .expect(200);
+
+    // Send opposite terminal (creates conflict_terminal)
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E031',
+        transactionRef: 'T019',
+        walletId: 'W001',
+        amountKobo: 100000,
+        currency: 'NGN',
+        status: 'failed'
+      })
+      .expect(409);
+
+    // Replay the conflicting event - should return 409 again, not 200
+    await request(app.getHttpServer())
+      .post('/provider/events')
+      .send({
+        eventId: 'E031',
+        transactionRef: 'T019',
+        walletId: 'W001',
+        amountKobo: 100000,
+        currency: 'NGN',
+        status: 'failed'
+      })
+      .expect(409);
+  });
 });

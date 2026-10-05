@@ -322,20 +322,46 @@ src/
 - If any exception is thrown inside `db.transaction(() => {...}).immediate()`, ALL changes roll back
 - This ensures atomicity: either all operations succeed or none do
 
-**Audit record preservation:**
-- Conflict/rejection records use **nested transactions** that commit independently
-- Pattern: `db.transaction(() => { INSERT audit }).immediate(); throw exception;`
-- The nested transaction commits before the exception, so audit survives
-- Examples: `rejected_events` (duplicate eventId), `provider_events` (terminal conflicts)
+**Audit record preservation strategy:**
+- Conflicts write audit records (rejected_events, provider_events with outcome='conflict_terminal')
+- Instead of throwing exceptions inside the transaction, return conflict markers
+- Transaction commits with audit records intact
+- Exception thrown AFTER transaction commits, so audit survives
+
+**Pattern used:**
+```typescript
+const outcome = db.transaction(() => {
+  // ... business logic ...
+  if (conflict) {
+    db.prepare('INSERT INTO rejected_events...').run(...);
+    return { conflict: 'reason' };  // Marker, not exception
+  }
+  return { result: successData };
+}).immediate();  // Transaction commits here with audit records
+
+if ('conflict' in outcome) throw new ConflictException(outcome.conflict);  // Thrown after commit
+return outcome.result;
+```
+
+**Why nested transactions don't work:**
+- `db.transaction()` called inside another transaction becomes a SAVEPOINT
+- Outer transaction rollback takes the savepoint with it
+- Audit records would be lost
 
 **Pre-flight checks:**
-- Read-only validations (wallet existence, currency match) happen BEFORE main transaction
+- Read-only validations (wallet existence, currency match) happen BEFORE transaction
 - Exceptions from these checks have no rollback concerns (no writes occurred)
+- eventId check moved INSIDE transaction to prevent race conditions with multiple processes
 
 **Main transaction guarantees:**
 - Balance updates ONLY happen with ledger_entry INSERT (same transaction)
 - If ledger insert fails, balance rollback is automatic
 - UNIQUE constraint on `transaction_ref` provides DB-level double-credit prevention
+- Audit records persist even when returning 409 errors
+
+**Transaction ordering:**
+- created_at has one-second resolution, can tie
+- ORDER BY created_at, rowid ensures deterministic history
 
 ## Database Schema
 
@@ -402,8 +428,10 @@ CREATE TABLE rejected_events (
 4. **Deposits only** - no withdrawals or debits
 5. **Event ordering is NOT guaranteed** - late events are handled gracefully
 6. **Idempotency based on eventId + full payload match** - same eventId with different payload is rejected
-7. **Terminal state conflicts require manual review** - system records but doesn't auto-resolve
+7. **Terminal state conflicts require manual review** - system records but doesn't auto-resolve (outcome='conflict_terminal')
 8. **Database path defaults to ./wallet.db** - override with `DB_PATH` environment variable
+9. **Currency mismatch and unknown wallet are NOT recorded** - these are validation errors, not business conflicts
+10. **Single Node process** - with multiple processes, pre-flight eventId check could race (PK constraint prevents double-credit)
 
 ## Why SQLite? Limitations vs PostgreSQL
 
@@ -457,6 +485,8 @@ CREATE TABLE rejected_events (
 7. **No retries or circuit breakers** - production would need resilience patterns
 8. **No webhook callbacks** - assumed synchronous response is sufficient
 9. **No comprehensive logging** - production needs structured logging (Winston/Pino)
+10. **Concurrency test runs in single process** - Promise.all demonstrates idempotency but not true parallel DB writes (would need multiple Node processes)
+11. **Pre-flight eventId check outside transaction** - with multiple processes, could race (PK constraint still prevents double-credit)
 
 ## Next Improvement
 
@@ -491,17 +521,3 @@ it('concurrent successful events for same transaction credit only once', async (
   expect(wallet.balance).toBe(100000); // Credited once
 });
 ```
-
-## Time Spent
-
-_[Leave blank for candidate to fill in honestly]_
-
-## AI Usage
-
-_[Leave blank for candidate to fill in honestly - whether/how AI tools were used]_
-
----
-
-## Section 2: Written Answers
-
-_[Reserved for candidate's written responses to assessment questions]_

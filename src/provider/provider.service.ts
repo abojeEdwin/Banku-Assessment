@@ -8,6 +8,10 @@ export interface EventResult {
   message: string;
 }
 
+type TransactionOutcome = 
+  | { result: EventResult }
+  | { conflict: string };
+
 @Injectable()
 export class ProviderService {
   constructor(private readonly dbService: DatabaseService) {}
@@ -15,55 +19,51 @@ export class ProviderService {
   processEvent(event: ProviderEventDto): EventResult {
     const db = this.dbService.getDb();
     
-    // Pre-flight checks outside main transaction (read-only, can throw without rollback concerns)
-    // These checks don't modify state, so exceptions here are safe
-    
-    // 1. Wallet must exist
+    // Pre-flight checks (read-only, safe to throw)
     const wallet = db.prepare('SELECT id, currency, balance_kobo FROM wallets WHERE id = ?').get(event.walletId) as any;
     if (!wallet) {
       throw new NotFoundException(`Wallet ${event.walletId} not found`);
     }
 
-    // 2. Currency must match wallet
     if (wallet.currency !== event.currency) {
       throw new ConflictException(`Currency mismatch: wallet is ${wallet.currency}, event is ${event.currency}`);
     }
 
-    // 3. Check if eventId already exists
-    const existingEvent = db.prepare(
-      'SELECT event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome FROM provider_events WHERE event_id = ?'
-    ).get(event.eventId) as any;
+    // ALL operations inside ONE synchronous transaction
+    // .immediate() prevents concurrent writers
+    // Audit records written inside transaction, conflicts returned as markers (not thrown)
+    const outcome: TransactionOutcome = db.transaction(() => {
+      // Check eventId (inside transaction to prevent race conditions with multiple processes)
+      const existingEvent = db.prepare(
+        'SELECT event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome FROM provider_events WHERE event_id = ?'
+      ).get(event.eventId) as any;
 
-    if (existingEvent) {
-      // Identical payload? Return stored result (idempotent)
-      if (
-        existingEvent.transaction_ref === event.transactionRef &&
-        existingEvent.wallet_id === event.walletId &&
-        existingEvent.amount_kobo === event.amountKobo &&
-        existingEvent.currency === event.currency &&
-        existingEvent.status === event.status
-      ) {
-        return { success: true, duplicate: true, message: 'Event already processed with same payload' };
-      }
+      if (existingEvent) {
+        // Identical payload? Return stored result (idempotent)
+        if (
+          existingEvent.transaction_ref === event.transactionRef &&
+          existingEvent.wallet_id === event.walletId &&
+          existingEvent.amount_kobo === event.amountKobo &&
+          existingEvent.currency === event.currency &&
+          existingEvent.status === event.status
+        ) {
+          // Check if this was a previously recorded conflict - should return 409 not 200
+          if (existingEvent.outcome === 'conflict_terminal') {
+            return { conflict: 'Terminal status conflict - manual review required' };
+          }
+          return { result: { success: true, duplicate: true, message: 'Event already processed with same payload' } };
+        }
 
-      // Different payload with same eventId - persist rejection in separate transaction, then throw
-      // Separate transaction ensures audit record survives the exception
-      db.transaction(() => {
+        // Different payload - write to rejected_events, return conflict marker
         db.prepare(`
           INSERT INTO rejected_events (event_id, raw_payload, reason)
           VALUES (?, ?, ?)
         `).run(event.eventId, JSON.stringify(event), 'Duplicate eventId with different payload');
-      }).immediate();
-      
-      throw new ConflictException('Event ID already used with different payload');
-    }
-    
-    // ALL state-changing operations run inside ONE synchronous transaction
-    // .immediate() prevents concurrent writers from starting
-    // If this transaction throws, ALL changes within it roll back
-    const result = db.transaction(() => {
+        
+        return { conflict: 'Event ID already used with different payload' };
+      }
 
-      // 4. Check if transactionRef already exists
+      // Check if transactionRef exists
       const existingTxn = db.prepare(
         'SELECT transaction_ref, wallet_id, amount_kobo, currency, status FROM transactions WHERE transaction_ref = ?'
       ).get(event.transactionRef) as any;
@@ -75,16 +75,13 @@ export class ProviderService {
           existingTxn.amount_kobo !== event.amountKobo ||
           existingTxn.currency !== event.currency
         ) {
-          // Persist rejection in nested transaction (commits immediately), then throw
-          // Nested transaction commits independently - audit record survives the outer rollback
-          db.transaction(() => {
-            db.prepare(`
-              INSERT INTO rejected_events (event_id, raw_payload, reason)
-              VALUES (?, ?, ?)
-            `).run(event.eventId, JSON.stringify(event), 'Transaction attributes mismatch');
-          }).immediate();
+          // Write to rejected_events, return conflict marker (transaction will commit this)
+          db.prepare(`
+            INSERT INTO rejected_events (event_id, raw_payload, reason)
+            VALUES (?, ?, ?)
+          `).run(event.eventId, JSON.stringify(event), 'Transaction attributes mismatch');
           
-          throw new ConflictException('Transaction reference exists with different attributes');
+          return { conflict: 'Transaction reference exists with different attributes' };
         }
 
         // Apply state transition rules
@@ -98,13 +95,13 @@ export class ProviderService {
             VALUES (?, ?, ?, ?, ?, ?, ?)
           `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'duplicate_noop');
           
-          return { success: true, duplicate: false, message: 'Duplicate pending event ignored' };
+          return { result: { success: true, duplicate: false, message: 'Duplicate pending event ignored' } };
         }
 
         // pending + successful -> credit balance
         if (currentStatus === 'pending' && newStatus === 'successful') {
-          // Update transaction status
-          db.prepare('UPDATE transactions SET status = ?, updated_at = datetime("now") WHERE transaction_ref = ?')
+          // Update transaction status (fixed: single quotes for datetime)
+          db.prepare("UPDATE transactions SET status = ?, updated_at = datetime('now') WHERE transaction_ref = ?")
             .run('successful', event.transactionRef);
 
           // Insert ledger entry (UNIQUE constraint guarantees one credit per transaction)
@@ -122,12 +119,12 @@ export class ProviderService {
             VALUES (?, ?, ?, ?, ?, ?, ?)
           `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'applied');
 
-          return { success: true, duplicate: false, message: 'Transaction completed successfully' };
+          return { result: { success: true, duplicate: false, message: 'Transaction completed successfully' } };
         }
 
         // pending + failed -> mark failed, no credit
         if (currentStatus === 'pending' && newStatus === 'failed') {
-          db.prepare('UPDATE transactions SET status = ?, updated_at = datetime("now") WHERE transaction_ref = ?')
+          db.prepare("UPDATE transactions SET status = ?, updated_at = datetime('now') WHERE transaction_ref = ?")
             .run('failed', event.transactionRef);
 
           db.prepare(`
@@ -135,7 +132,7 @@ export class ProviderService {
             VALUES (?, ?, ?, ?, ?, ?, ?)
           `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'applied');
 
-          return { success: true, duplicate: false, message: 'Transaction marked as failed' };
+          return { result: { success: true, duplicate: false, message: 'Transaction marked as failed' } };
         }
 
         // terminal + pending -> ignore late event
@@ -145,7 +142,7 @@ export class ProviderService {
             VALUES (?, ?, ?, ?, ?, ?, ?)
           `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'ignored_late');
 
-          return { success: true, duplicate: false, message: 'Late pending event ignored' };
+          return { result: { success: true, duplicate: false, message: 'Late pending event ignored' } };
         }
 
         // terminal + same terminal -> no-op
@@ -155,27 +152,24 @@ export class ProviderService {
             VALUES (?, ?, ?, ?, ?, ?, ?)
           `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'duplicate_noop');
 
-          return { success: true, duplicate: false, message: 'Duplicate terminal status ignored' };
+          return { result: { success: true, duplicate: false, message: 'Duplicate terminal status ignored' } };
         }
 
         // successful <-> failed conflict (opposite terminal states)
+        // Write conflict to provider_events, return marker (transaction commits this row)
         if (
           (currentStatus === 'successful' && newStatus === 'failed') ||
           (currentStatus === 'failed' && newStatus === 'successful')
         ) {
-          // Persist conflict event in nested transaction (commits immediately), then throw
-          // Nested transaction commits independently - conflict audit survives the outer rollback
-          db.transaction(() => {
-            db.prepare(`
-              INSERT INTO provider_events (event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome)
-              VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'conflict_terminal');
-          }).immediate();
+          db.prepare(`
+            INSERT INTO provider_events (event_id, transaction_ref, wallet_id, amount_kobo, currency, status, outcome)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'conflict_terminal');
 
-          throw new ConflictException('Terminal status conflict - manual review required');
+          return { conflict: 'Terminal status conflict - manual review required' };
         }
       } else {
-        // 5. New transaction - insert and apply immediately if successful
+        // New transaction - insert and apply immediately if successful
         db.prepare(`
           INSERT INTO transactions (transaction_ref, wallet_id, amount_kobo, currency, status)
           VALUES (?, ?, ?, ?, ?)
@@ -197,13 +191,18 @@ export class ProviderService {
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `).run(event.eventId, event.transactionRef, event.walletId, event.amountKobo, event.currency, event.status, 'applied');
 
-        return { success: true, duplicate: false, message: 'New transaction processed' };
+        return { result: { success: true, duplicate: false, message: 'New transaction processed' } };
       }
 
       // Should never reach here
       throw new Error('Unhandled state transition');
     }).immediate();
 
-    return result;
+    // Throw AFTER transaction commits (audit records persist)
+    if ('conflict' in outcome) {
+      throw new ConflictException(outcome.conflict);
+    }
+    
+    return outcome.result;
   }
 }

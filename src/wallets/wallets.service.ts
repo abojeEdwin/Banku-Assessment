@@ -32,12 +32,12 @@ export class WalletsService {
       throw new NotFoundException(`Wallet ${walletId} not found`);
     }
 
-    // Get all transactions ordered by created_at
+    // Get all transactions ordered by created_at, then rowid for tie-breaking
     const transactions = db.prepare(`
       SELECT transaction_ref, amount_kobo, currency, status
       FROM transactions
       WHERE wallet_id = ?
-      ORDER BY created_at ASC
+      ORDER BY created_at ASC, rowid ASC
     `).all(walletId) as any[];
 
     return {
